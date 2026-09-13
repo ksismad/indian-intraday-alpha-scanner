@@ -7,7 +7,6 @@ services:
     dockerfilePath: ./Dockerfile
     healthCheckPath: /health
     numInstances: 1
-    maxShutdownDelaySeconds: 120
     disk:
       name: scanner-runtime
       mountPath: /app/runtime
