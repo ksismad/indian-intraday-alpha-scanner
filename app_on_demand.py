@@ -79,18 +79,18 @@ def scan_cycle():
 
 @st.fragment(run_every="60s")
 def dashboard():
+    # Each fragment rerun represents the next on-demand scan cycle.
+    # The page itself must remain open for subsequent cycles.
     run_now = st.button("Run scan now", type="primary", use_container_width=True)
-    first = st.session_state.last_scan is None
-    if first or run_now:
-        broad_df, signals, mkt = scan_cycle()
-        st.session_state.broad = broad_df
-        st.session_state.market = mkt
-        st.session_state.last_scan = datetime.now(timezone.utc)
-        if not signals.empty:
-            st.session_state.signals = signals
+    broad_df, signals, mkt = scan_cycle()
+    st.session_state.broad = broad_df
+    st.session_state.market = mkt
+    st.session_state.last_scan = datetime.now(timezone.utc)
+    if not signals.empty:
+        st.session_state.signals = signals
 
     mkt = st.session_state.market
-    st.write(f"Last scan UTC: {st.session_state.last_scan.isoformat(timespec='seconds') if st.session_state.last_scan else 'waiting'}")
+    st.write(f"Last scan UTC: {st.session_state.last_scan.isoformat(timespec='seconds')}")
     a, b, c = st.columns(3)
     a.metric("Market regime", mkt.get("regime", "UNKNOWN"))
     move = mkt.get("move15")
@@ -115,6 +115,6 @@ def dashboard():
         st.dataframe(signals.head(20)[why], use_container_width=True, hide_index=True)
         st.download_button("Download current validated signals CSV", signals.to_csv(index=False).encode(), "intraday_signals.csv", "text/csv")
 
-    st.caption("Streamlit-only mode. Scanning runs only while the page is open. Missing current market data produces no trade signal. No worker, Render service, VPS, RESULTS_URL, or synthetic fallback is used by this entrypoint.")
+    st.caption("Streamlit-only on-demand mode. Scanning runs only while this page is open. No Render, VPS, worker API, RESULTS_URL, or synthetic fallback is used by this entrypoint.")
 
 dashboard()
