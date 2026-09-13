@@ -19,6 +19,8 @@ MIN_ATR = float(os.getenv("MIN_ATR_PCT", "1.8"))
 MIN_VOL = float(os.getenv("MIN_VOL_SHOCK", "1.5"))
 MIN_RR = float(os.getenv("MIN_RR", "2.0"))
 NEWS_GATE = float(os.getenv("NEWS_GATE", "0"))
+BROAD_CACHE_TTL = max(10, int(os.getenv("BROAD_CACHE_TTL_MINUTES", "45")))
+SIGNAL_TTL = max(1, int(os.getenv("SIGNAL_TTL_MINUTES", "10")))
 RUN_FOREVER = os.getenv("RUN_FOREVER", "1") != "0"
 OUT = Path(os.getenv("RESULTS_FILE", "runtime/results.json"))
 STATE = Path(os.getenv("STATE_FILE", "runtime/scanner_state.json"))
@@ -29,8 +31,13 @@ def _stop(*_):
     global STOP
     STOP = True
 
+
 signal.signal(signal.SIGTERM, _stop)
 signal.signal(signal.SIGINT, _stop)
+
+
+def now_ts() -> float:
+    return time.time()
 
 
 def load_state() -> dict:
@@ -45,6 +52,15 @@ def save_state(state: dict):
     STATE.write_text(json.dumps(state, default=str), encoding="utf-8")
 
 
+def prune_broad_cache(state: dict):
+    cutoff = now_ts() - BROAD_CACHE_TTL * 60
+    state["broad_cache"] = {
+        symbol: row
+        for symbol, row in state.get("broad_cache", {}).items()
+        if float(row.get("ScannedUnix", 0) or 0) >= cutoff
+    }
+
+
 def write_payload(market: dict, universe_count: int, scanned_count: int, signals: pd.DataFrame, status: str, cycle_started: float):
     payload = {
         "updated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -54,63 +70,116 @@ def write_payload(market: dict, universe_count: int, scanned_count: int, signals
         "scanned_count": scanned_count,
         "signals": signals.to_dict(orient="records") if not signals.empty else [],
         "runtime_seconds": round(time.time() - cycle_started, 2),
+        "signal_policy": "No synthetic/fallback market data is eligible for signals; stale signals expire.",
     }
     OUT.parent.mkdir(parents=True, exist_ok=True)
-    OUT.write_text(json.dumps(payload, default=str), encoding="utf-8")
+    tmp = OUT.with_suffix(OUT.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, default=str), encoding="utf-8")
+    tmp.replace(OUT)
 
 
 def main():
     state = load_state()
+    state.setdefault("broad_cache", {})
+    state.setdefault("signals", [])
     OUT.parent.mkdir(parents=True, exist_ok=True)
     while not STOP:
         started = time.time()
         try:
             universe_df = scanner_engine.nse_universe()
-            universe = universe_df["Symbol"].tolist() if not universe_df.empty else scanner_engine.FALLBACK
+            if universe_df.empty:
+                write_payload({}, 0, 0, pd.DataFrame(), "NO_UNIVERSE_DATA", started)
+                raise RuntimeError("Current NSE EQ security master unavailable")
+
+            universe = universe_df["Symbol"].tolist()
             n = len(universe)
             cursor = int(state.get("cursor", 0)) % n
             batch = [universe[(cursor + i) % n] for i in range(min(BATCH_SIZE, n))]
             state["cursor"] = (cursor + len(batch)) % n
+            prune_broad_cache(state)
+
             mkt = scanner_engine.market()
-            retained = {}
+            if mkt.get("regime") == "NO_DATA":
+                state["signals"] = []
+                write_payload(mkt, n, len(state["broad_cache"]), pd.DataFrame(), "NO_MARKET_DATA", started)
+                save_state(state)
+                if not RUN_FOREVER:
+                    break
+                time.sleep(max(5, INTERVAL - (time.time() - started)))
+                continue
 
             def on_broad(done, total, partial):
                 if not partial.empty:
                     for row in partial.to_dict("records"):
+                        row["ScannedUnix"] = now_ts()
                         state["broad_cache"][row["Symbol"]] = row
-                rolling = pd.DataFrame(state["broad_cache"].values())
-                if not rolling.empty:
-                    rolling = rolling.sort_values("BroadScore", ascending=False).reset_index(drop=True)
-                write_payload(mkt, n, len(state["broad_cache"]), pd.DataFrame(state.get("signals", [])), f"broad_scan {done}/{total}", started)
+                prune_broad_cache(state)
+                write_payload(
+                    mkt,
+                    n,
+                    len(state["broad_cache"]),
+                    pd.DataFrame(),
+                    f"broad_scan {done}/{total}",
+                    started,
+                )
 
             broad_batch = scanner_engine.broad(batch, "NS", workers=WORKERS, on_update=on_broad)
             if not broad_batch.empty:
                 for row in broad_batch.to_dict("records"):
+                    row["ScannedUnix"] = now_ts()
                     state["broad_cache"][row["Symbol"]] = row
+            prune_broad_cache(state)
             rolling = pd.DataFrame(state["broad_cache"].values())
+
             if rolling.empty:
-                write_payload(mkt, n, 0, pd.DataFrame(), "waiting_for_market_data", started)
+                state["signals"] = []
+                write_payload(mkt, n, 0, pd.DataFrame(), "WAITING_FOR_MARKET_DATA", started)
             else:
                 rolling = rolling.sort_values("BroadScore", ascending=False).reset_index(drop=True)
                 candidates = rolling.head(DEEP_LIMIT).copy()
+                state["signals"] = []  # never carry an old signal into a new validation cycle
 
                 def on_deep(done, total, partial):
-                    if not partial.empty:
-                        state["signals"] = partial.to_dict(orient="records")
-                    current = pd.DataFrame(state.get("signals", []))
+                    current = partial.sort_values(["Reliability", "R:R"], ascending=False).reset_index(drop=True) if not partial.empty else pd.DataFrame()
                     write_payload(mkt, n, len(state["broad_cache"]), current, f"deep_scan {done}/{total}", started)
-                    if not partial.empty:
-                        best = partial.iloc[0]
-                        print(f"SELECTED {best['Symbol']} {best['Direction']} reliability={best['Reliability']}", flush=True)
+                    if not current.empty:
+                        best = current.iloc[0]
+                        print(
+                            f"SELECTED {best['Symbol']} {best['Direction']} reliability={best['Reliability']}",
+                            flush=True,
+                        )
 
-                final = scanner_engine.deep(candidates, mkt, MIN_ATR, MIN_VOL, MIN_RR, NEWS_GATE, workers=max(4, WORKERS // 2), on_update=on_deep)
-                if not final.empty:
-                    state["signals"] = final.to_dict(orient="records")
-                write_payload(mkt, n, len(state["broad_cache"]), final if not final.empty else pd.DataFrame(state.get("signals", [])), "cycle_complete", started)
+                final = scanner_engine.deep(
+                    candidates,
+                    mkt,
+                    MIN_ATR,
+                    MIN_VOL,
+                    MIN_RR,
+                    NEWS_GATE,
+                    workers=max(4, WORKERS // 2),
+                    on_update=on_deep,
+                )
+                state["signals"] = final.to_dict(orient="records") if not final.empty else []
+                write_payload(
+                    mkt,
+                    n,
+                    len(state["broad_cache"]),
+                    final,
+                    "CYCLE_COMPLETE_WITH_SIGNALS" if not final.empty else "CYCLE_COMPLETE_NO_VALID_SIGNALS",
+                    started,
+                )
+
             save_state(state)
-            print(f"{datetime.now(timezone.utc).isoformat(timespec='seconds')} batch={len(batch)} universe={n} retained={len(state['broad_cache'])} signals={len(state.get('signals', []))}", flush=True)
+            print(
+                f"{datetime.now(timezone.utc).isoformat(timespec='seconds')} "
+                f"batch={len(batch)} universe={n} retained={len(state['broad_cache'])} "
+                f"signals={len(state.get('signals', []))}",
+                flush=True,
+            )
         except Exception as exc:
             print(f"SCAN ERROR: {exc}", flush=True)
+            if not OUT.exists():
+                write_payload({}, 0, 0, pd.DataFrame(), "WORKER_ERROR", started)
         if not RUN_FOREVER:
             break
         elapsed = time.time() - started
