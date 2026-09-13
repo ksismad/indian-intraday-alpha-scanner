@@ -1,8 +1,4 @@
-"""Continuous scanner worker.
-
-Runs an incremental full-universe scan, writes provisional/high-confidence results
-as soon as they are found, and then starts the next cycle. It never places orders.
-"""
+"""Always-on incremental scanner worker for VPS/Docker/Railway/Render."""
 from __future__ import annotations
 
 import json
@@ -15,12 +11,18 @@ from pathlib import Path
 import pandas as pd
 import scanner_engine
 
-INTERVAL = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))
+INTERVAL = max(30, int(os.getenv("SCAN_INTERVAL_SECONDS", "60")))
+BATCH_SIZE = max(20, int(os.getenv("UNIVERSE_BATCH_SIZE", "60")))
+DEEP_LIMIT = max(5, int(os.getenv("DEEP_LIMIT", "15")))
+WORKERS = max(4, int(os.getenv("WORKERS", "16")))
+MIN_ATR = float(os.getenv("MIN_ATR_PCT", "1.8"))
+MIN_VOL = float(os.getenv("MIN_VOL_SHOCK", "1.5"))
+MIN_RR = float(os.getenv("MIN_RR", "2.0"))
+NEWS_GATE = float(os.getenv("NEWS_GATE", "0"))
 RUN_FOREVER = os.getenv("RUN_FOREVER", "1") != "0"
-DEEP_LIMIT = int(os.getenv("DEEP_LIMIT", "250"))
 OUT = Path(os.getenv("RESULTS_FILE", "runtime/results.json"))
+STATE = Path(os.getenv("STATE_FILE", "runtime/scanner_state.json"))
 STOP = False
-CURRENT = {"signals": [], "universe_count": 0, "candidate_count": 0, "status": "starting"}
 
 
 def _stop(*_):
@@ -31,53 +33,88 @@ signal.signal(signal.SIGTERM, _stop)
 signal.signal(signal.SIGINT, _stop)
 
 
-def write_payload(market: dict, universe_count: int, candidate_count: int, signals: pd.DataFrame, started: float, status: str):
+def load_state() -> dict:
+    try:
+        return json.loads(STATE.read_text(encoding="utf-8"))
+    except Exception:
+        return {"cursor": 0, "broad_cache": {}, "signals": []}
+
+
+def save_state(state: dict):
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(json.dumps(state, default=str), encoding="utf-8")
+
+
+def write_payload(market: dict, universe_count: int, scanned_count: int, signals: pd.DataFrame, status: str, cycle_started: float):
     payload = {
         "updated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "status": status,
         "market": market,
         "universe_count": universe_count,
-        "candidate_count": candidate_count,
+        "scanned_count": scanned_count,
         "signals": signals.to_dict(orient="records") if not signals.empty else [],
-        "runtime_seconds": round(time.time() - started, 2),
+        "runtime_seconds": round(time.time() - cycle_started, 2),
     }
+    OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps(payload, default=str), encoding="utf-8")
 
 
 def main():
+    state = load_state()
     OUT.parent.mkdir(parents=True, exist_ok=True)
     while not STOP:
         started = time.time()
         try:
-            universe = scanner_engine.nse_universe()
-            symbols = universe["Symbol"].tolist() if not universe.empty else scanner_engine.FALLBACK
+            universe_df = scanner_engine.nse_universe()
+            universe = universe_df["Symbol"].tolist() if not universe_df.empty else scanner_engine.FALLBACK
+            n = len(universe)
+            cursor = int(state.get("cursor", 0)) % n
+            batch = [universe[(cursor + i) % n] for i in range(min(BATCH_SIZE, n))]
+            state["cursor"] = (cursor + len(batch)) % n
             mkt = scanner_engine.market()
-            broad_holder = {"df": pd.DataFrame()}
+            retained = {}
 
             def on_broad(done, total, partial):
-                broad_holder["df"] = partial
-                # Keep the latest broad pass observable while the search is still running.
-                write_payload(mkt, len(symbols), len(partial), pd.DataFrame(), started, f"broad_scan {done}/{total}")
-
-            broad_df = scanner_engine.broad(symbols, "NS", workers=16, on_update=on_broad)
-            candidates = broad_df.head(DEEP_LIMIT).copy()
-            latest = {"df": pd.DataFrame()}
-
-            def on_deep(done, total, partial):
-                latest["df"] = partial
-                write_payload(mkt, len(symbols), len(broad_df), partial, started, f"deep_scan {done}/{total}")
                 if not partial.empty:
-                    best = partial.iloc[0]
-                    print(f"SELECTED {best['Symbol']} {best['Direction']} reliability={best['Reliability']}", flush=True)
+                    for row in partial.to_dict("records"):
+                        state["broad_cache"][row["Symbol"]] = row
+                rolling = pd.DataFrame(state["broad_cache"].values())
+                if not rolling.empty:
+                    rolling = rolling.sort_values("BroadScore", ascending=False).reset_index(drop=True)
+                write_payload(mkt, n, len(state["broad_cache"]), pd.DataFrame(state.get("signals", [])), f"broad_scan {done}/{total}", started)
 
-            final = scanner_engine.deep(candidates, mkt, 1.5, 1.3, 2.0, 0.0, workers=12, on_update=on_deep)
-            write_payload(mkt, len(symbols), len(broad_df), final, started, "cycle_complete")
-            print(f"{datetime.now(timezone.utc).isoformat(timespec='seconds')} universe={len(symbols)} candidates={len(broad_df)} signals={len(final)}", flush=True)
+            broad_batch = scanner_engine.broad(batch, "NS", workers=WORKERS, on_update=on_broad)
+            if not broad_batch.empty:
+                for row in broad_batch.to_dict("records"):
+                    state["broad_cache"][row["Symbol"]] = row
+            rolling = pd.DataFrame(state["broad_cache"].values())
+            if rolling.empty:
+                write_payload(mkt, n, 0, pd.DataFrame(), "waiting_for_market_data", started)
+            else:
+                rolling = rolling.sort_values("BroadScore", ascending=False).reset_index(drop=True)
+                candidates = rolling.head(DEEP_LIMIT).copy()
+
+                def on_deep(done, total, partial):
+                    if not partial.empty:
+                        state["signals"] = partial.to_dict(orient="records")
+                    current = pd.DataFrame(state.get("signals", []))
+                    write_payload(mkt, n, len(state["broad_cache"]), current, f"deep_scan {done}/{total}", started)
+                    if not partial.empty:
+                        best = partial.iloc[0]
+                        print(f"SELECTED {best['Symbol']} {best['Direction']} reliability={best['Reliability']}", flush=True)
+
+                final = scanner_engine.deep(candidates, mkt, MIN_ATR, MIN_VOL, MIN_RR, NEWS_GATE, workers=max(4, WORKERS // 2), on_update=on_deep)
+                if not final.empty:
+                    state["signals"] = final.to_dict(orient="records")
+                write_payload(mkt, n, len(state["broad_cache"]), final if not final.empty else pd.DataFrame(state.get("signals", [])), "cycle_complete", started)
+            save_state(state)
+            print(f"{datetime.now(timezone.utc).isoformat(timespec='seconds')} batch={len(batch)} universe={n} retained={len(state['broad_cache'])} signals={len(state.get('signals', []))}", flush=True)
         except Exception as exc:
             print(f"SCAN ERROR: {exc}", flush=True)
         if not RUN_FOREVER:
             break
-        time.sleep(max(10, INTERVAL))
+        elapsed = time.time() - started
+        time.sleep(max(5, INTERVAL - elapsed))
 
 
 if __name__ == "__main__":
