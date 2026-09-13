@@ -31,14 +31,34 @@ streamlit run app.py
 
 Both processes can read the same `runtime/results.json` on a VPS or shared volume.
 
+## Production deployment with Render
+
+The repository includes `render.yaml`, which defines a Docker web service that runs `api_server.py`, supervises `worker.py`, exposes `/results` and `/health`, and stores runtime state under a persistent disk. Render supports Docker services, health checks, environment variables and persistent disks; current compute plans and pricing are selected in the Render account. citeturn249477search0turn477873search1turn249477search1turn574098search1
+
+### Deploy
+
+1. In Render, create a **Blueprint** from this GitHub repository and select `render.yaml`.
+2. Keep one instance for this scanner service. The Blueprint uses Docker, a persistent `/app/runtime` disk, and `/health` as the health check.
+3. After deployment, open `https://YOUR-SERVICE.onrender.com/health` and confirm `worker_running` is `true`.
+4. Open `https://YOUR-SERVICE.onrender.com/results` and wait for the first successful scan payload.
+5. In Streamlit Community Cloud, set this environment variable/secret:
+
+```text
+RESULTS_URL=https://YOUR-SERVICE.onrender.com/results
+RESULTS_STALE_SECONDS=180
+```
+
+The Streamlit dashboard will then poll the worker API every 5 seconds while the worker continues scanning independently.
+
+Render web services must bind to `0.0.0.0`; the supplied Dockerfile/API uses port `10000`. Render can automatically redeploy a linked Git branch when new commits are pushed. citeturn477873search2turn477873search1
+
+### Environment variables
+
+The Blueprint contains non-secret scanner configuration defaults. Do not commit broker access tokens or other credentials; add secrets through Render's environment/secret settings. citeturn249477search3
+
 ## Always-on deployment
 
-Use the included `Dockerfile` or run:
-
-```bash
-pip install -r requirements.txt
-python worker.py
-```
+The API server is the production entrypoint. For a plain VPS/container without the API layer, `python worker.py` remains supported.
 
 Useful environment variables:
 
@@ -54,13 +74,15 @@ NEWS_GATE=0
 BROAD_CACHE_TTL_MINUTES=45
 SIGNAL_TTL_MINUTES=10
 RUN_FOREVER=1
-RESULTS_FILE=runtime/results.json
-STATE_FILE=runtime/scanner_state.json
+RESULTS_FILE=/app/runtime/results.json
+STATE_FILE=/app/runtime/scanner_state.json
 RESULTS_STALE_SECONDS=180
-RESULTS_URL=
+START_WORKER=1
 ```
 
-A dedicated VPS/container is preferable to a shared web-app runtime for the always-on worker.
+## Reliability order
+
+The UI sorts by Reliability and then R:R. It displays Grade, Direction, Entry, Stop Loss, Target, R:R, ATR, execution ATR, volume shock, 5m/15m/1h trend, breakouts, relative strength, news score/freshness and market regime.
 
 ## Data and live-feed boundary
 
