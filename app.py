@@ -1,7 +1,7 @@
 from __future__ import annotations
 from datetime import datetime, timezone
 import streamlit as st
-from scanner_engine import broad_daily_candidates, deep_scan, fetch_nse_universe, market_snapshot, FALLBACK_NSE
+from scanner_engine import broad, deep, market, nse_universe, FALLBACK
 
 st.set_page_config(page_title="Indian Intraday Alpha Scanner", page_icon="📈", layout="wide")
 st.title("Indian Intraday Alpha Scanner")
@@ -9,7 +9,7 @@ st.caption("Full NSE EQ universe → automatic filters → market response + new
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def load_universe():
-    return fetch_nse_universe()
+    return nse_universe()
 
 with st.sidebar:
     st.header("Engine")
@@ -25,19 +25,19 @@ with st.sidebar:
 def dashboard():
     st.write(f"Heartbeat UTC: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}")
     uni = load_universe()
-    symbols = uni["Symbol"].tolist() if not uni.empty else FALLBACK_NSE
-    market = market_snapshot()
-    broad = broad_daily_candidates(symbols, "NS", workers=workers)
-    if broad.empty:
+    symbols = uni["Symbol"].tolist() if not uni.empty else FALLBACK
+    mkt = market()
+    broad_df = broad(symbols, exchange="NS", workers=workers)
+    if broad_df.empty:
         st.error("No market data returned. The engine will retry automatically.")
         return
-    candidates = broad.head(int(deep_limit)).copy()
-    signals = deep_scan(candidates, market, min_atr_pct=float(min_atr), min_vol_shock=float(min_vol), min_rr=float(min_rr), news_threshold=float(news_gate), workers=workers)
+    candidates = broad_df.head(int(deep_limit)).copy()
+    signals = deep(candidates, mkt, min_atr=float(min_atr), min_vol=float(min_vol), min_rr=float(min_rr), news_gate=float(news_gate), workers=workers)
     c1,c2,c3,c4=st.columns(4)
     c1.metric("NSE EQ universe", f"{len(symbols):,}")
-    c2.metric("Broad candidates", f"{len(broad):,}")
+    c2.metric("Broad candidates", f"{len(broad_df):,}")
     c3.metric("Qualified setups", f"{len(signals):,}")
-    c4.metric("Market regime", market.get("regime", "UNKNOWN"))
+    c4.metric("Market regime", mkt.get("regime", "UNKNOWN"))
     if signals.empty:
         st.warning("No qualifying setup right now. Capital preserved; scanner continues watching.")
         return
@@ -49,4 +49,4 @@ def dashboard():
     st.download_button("Download current signals CSV", signals.to_csv(index=False).encode(), "intraday_signals.csv", "text/csv")
 
 dashboard()
-st.caption("Research/analytics only. The scanner ranks evidence; it does not guarantee outcomes or place orders. For true large-universe tick streaming, configure a licensed/broker WebSocket on a server; do not put broker credentials in source code.")
+st.caption("Research/analytics only. The scanner ranks evidence; it does not guarantee outcomes or place orders. True large-universe streaming requires a broker/licensed WebSocket feed; Upstox V3 supports real-time market updates and reconnect support.")
