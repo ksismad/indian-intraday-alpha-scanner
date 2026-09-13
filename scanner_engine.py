@@ -102,9 +102,10 @@ def market() -> dict:
     return {"move15":m,"regime":"BULLISH" if m>0.25 else ("BEARISH" if m<-0.25 else "NEUTRAL"),"updated":datetime.now(timezone.utc).isoformat(timespec="seconds")}
 
 
-def broad(symbol_list: list[str], exchange="NS", workers=16, cap=None) -> pd.DataFrame:
+def broad(symbol_list: list[str], exchange="NS", workers=16, cap=None, on_update=None) -> pd.DataFrame:
     todo=symbol_list[:cap] if cap else symbol_list
     rows=[]
+    done=0
     def one(s):
         d=chart(f"{s}.{exchange}","1d","4mo")
         a=indicators(d)
@@ -113,18 +114,26 @@ def broad(symbol_list: list[str], exchange="NS", workers=16, cap=None) -> pd.Dat
         score=min(np.log1p(max(dv,0))/30,1)*50 + min(max(a["atr_pct"],0)/8,1)*30 + min(abs(a["ret15"])/5,1)*20
         return {"Symbol":s,"Ticker":f"{s}.{exchange}",**a,"DollarVolume":dv,"BroadScore":score}
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        fs=[ex.submit(one,s) for s in todo]
-        for f in as_completed(fs):
+        futs={ex.submit(one,s):s for s in todo}
+        for f in as_completed(futs):
+            done += 1
             try:
                 x=f.result()
-                if x: rows.append(x)
-            except Exception: pass
+                if x:
+                    rows.append(x)
+            except Exception:
+                x=None
+            if on_update:
+                snap=pd.DataFrame(rows).sort_values("BroadScore",ascending=False).reset_index(drop=True) if rows else pd.DataFrame()
+                on_update(done, len(todo), snap)
     return pd.DataFrame(rows).sort_values("BroadScore",ascending=False).reset_index(drop=True) if rows else pd.DataFrame()
 
 
-def deep(candidates: pd.DataFrame, mkt: dict, min_atr=1.8, min_vol=1.5, min_rr=2.0, news_gate=0.0, workers=12) -> pd.DataFrame:
+def deep(candidates: pd.DataFrame, mkt: dict, min_atr=1.8, min_vol=1.5, min_rr=2.0, news_gate=0.0, workers=12, on_update=None) -> pd.DataFrame:
     if candidates.empty: return pd.DataFrame()
     out=[]
+    total=len(candidates)
+    done=0
     def one(r):
         m5,h1=chart(r.Ticker,"5m","5d"),chart(r.Ticker,"60m","60d")
         if m5.empty or h1.empty: return None
@@ -151,8 +160,13 @@ def deep(candidates: pd.DataFrame, mkt: dict, min_atr=1.8, min_vol=1.5, min_rr=2
     with ThreadPoolExecutor(max_workers=workers) as ex:
         fs=[ex.submit(one,r) for _,r in candidates.iterrows()]
         for f in as_completed(fs):
+            done += 1
             try:
                 x=f.result()
                 if x: out.append(x)
-            except Exception: pass
+            except Exception:
+                x=None
+            if on_update:
+                snap=pd.DataFrame(out).sort_values(["Reliability","R:R"],ascending=False).reset_index(drop=True) if out else pd.DataFrame()
+                on_update(done,total,snap)
     return pd.DataFrame(out).sort_values(["Reliability","R:R"],ascending=False).reset_index(drop=True) if out else pd.DataFrame()
