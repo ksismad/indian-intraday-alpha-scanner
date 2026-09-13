@@ -7,7 +7,7 @@ from scanner_engine import broad, deep, market, nse_universe
 
 st.set_page_config(page_title="Indian Intraday Alpha Scanner", page_icon="📈", layout="wide")
 st.title("Indian Intraday Alpha Scanner")
-st.caption("Full NSE EQ universe → rule-based discovery shortlist → deep analysis of every shortlisted share")
+st.caption("Full NSE EQ universe → discovery → catalyst/news context → deep validation of every shortlisted share")
 
 with st.sidebar:
     workers = st.slider("Broad workers", 2, 6, 4)
@@ -15,7 +15,8 @@ with st.sidebar:
     min_shortlist_score = st.number_input("Minimum discovery score", 0.0, 100.0, 45.0, 1.0)
     min_atr = st.number_input("Minimum 15m ATR %", 0.5, 10.0, 1.8, 0.1)
     min_rr = st.number_input("Minimum R:R", 1.0, 5.0, 2.0, 0.1)
-    news_gate = st.number_input("News gate", 0.0, 0.9, 0.0, 0.05)
+    news_gate = st.number_input("Minimum fresh news score", 0.0, 0.9, 0.10, 0.05)
+    st.caption("News is treated as a core confirmation layer. A fresh, direction-aligned catalyst materially improves reliability; with the default 0.10 gate, technically valid setups without meaningful recent news are not promoted as final signals.")
     st.caption("No fixed 25/100 share cap. Every current NSE EQ symbol is scanned in discovery; every discovery-shortlisted name is sent through deep validation in controlled batches.")
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -111,7 +112,7 @@ def scan_all():
 
 @st.fragment(run_every="60s")
 def dashboard():
-    st.info("The broad stage scans the complete current NSE EQ universe. There is no fixed stock-count cap. The discovery shortlist is score-gated, and every shortlisted name receives genuine 5m + 15m + 1h deep validation in controlled batches.")
+    st.info("The broad stage scans the complete current NSE EQ universe. There is no fixed stock-count cap. News/catalyst alignment is now part of final qualification, and every score-gated shortlist member receives genuine 5m + 15m + 1h deep validation in controlled batches.")
 
     run_now = st.button("Run complete universe scan now", type="primary", use_container_width=True)
     if st.session_state.last_scan is None or run_now:
@@ -148,7 +149,7 @@ def dashboard():
     st.subheader("Deep Analysis — Every Shortlisted Share")
     signals = st.session_state.signals
     if signals.empty:
-        st.info("No shortlisted share currently has a fully validated setup. A deep rejection is not converted into a trade signal.")
+        st.info("No shortlisted share currently has a fully validated setup. A deep rejection is not converted into a trade signal, including when the fresh-news requirement is not met.")
     else:
         st.dataframe(signals[signal_cols(signals)], use_container_width=True, hide_index=True)
         why = [c for c in ["Symbol","Grade","Reliability","Why","Catalyst","News Freshness Min","DataSource","Updated UTC"] if c in signals.columns]
